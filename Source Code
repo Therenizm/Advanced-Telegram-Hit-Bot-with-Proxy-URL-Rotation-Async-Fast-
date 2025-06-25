@@ -1,0 +1,395 @@
+import asyncio
+import aiohttp
+import random
+import threading
+import time
+import logging
+import smtplib
+from email.mime.text import MIMEText
+from telegram import Update
+from telegram.ext import CommandHandler, Updater
+
+# AYARLAR
+TELEGRAM_TOKEN = "BOT_TOKENINIZI_BURAYA_YAZIN"
+CHAT_ID = 123456789  # Komut kabul edilen Telegram kullanıcı ID'si
+
+EMAIL_ENABLED = False
+EMAIL_SMTP_SERVER = "smtp.gmail.com"
+EMAIL_SMTP_PORT = 587
+EMAIL_USER = "ornek@gmail.com"
+EMAIL_PASS = "sifre"
+EMAIL_TO = "hedef@eposta.com"
+
+DISCORD_ENABLED = False
+DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/..."
+
+urls = []
+proxies = []
+proxy_errors = {}
+hit_count = 0
+fail_count = 0
+total_request_time = 0
+bot_running = False
+start_time = None
+hit_thread = None
+
+user_agents = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+    "Mozilla/5.0 (Linux; Android 10; SM-A107F)",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 14_2 like Mac OS X)"
+]
+
+logging.basicConfig(
+    filename="log.txt",
+    level=logging.INFO,
+    format="%(asctime)s - %(message)s",
+    encoding="utf-8"
+)
+
+def load_proxies():
+    global proxies
+    try:
+        with open("proxy.txt", "r") as f:
+            proxies = [line.strip() for line in f if line.strip()]
+    except FileNotFoundError:
+        proxies = []
+    logging.info(f"Proxy listesi yüklendi: {len(proxies)} adet")
+
+def save_banned_proxy(proxy):
+    with open("banned_proxies.txt", "a") as f:
+        f.write(proxy + "\n")
+    logging.info(f"Proxy banlandı ve kaydedildi: {proxy}")
+
+def load_urls():
+    global urls
+    try:
+        with open("urls.txt", "r") as f:
+            urls = [line.strip() for line in f if line.strip()]
+    except FileNotFoundError:
+        urls = []
+    logging.info(f"URL listesi yüklendi: {len(urls)} adet")
+
+def send_email(subject, body):
+    if not EMAIL_ENABLED:
+        return
+    try:
+        msg = MIMEText(body)
+        msg['Subject'] = subject
+        msg['From'] = EMAIL_USER
+        msg['To'] = EMAIL_TO
+
+        server = smtplib.SMTP(EMAIL_SMTP_SERVER, EMAIL_SMTP_PORT)
+        server.starttls()
+        server.login(EMAIL_USER, EMAIL_PASS)
+        server.sendmail(EMAIL_USER, [EMAIL_TO], msg.as_string())
+        server.quit()
+    except Exception as e:
+        logging.error(f"E-posta gönderilemedi: {e}")
+
+def send_discord_notification(message):
+    if not DISCORD_ENABLED:
+        return
+    try:
+        import requests
+        data = {"content": message}
+        response = requests.post(DISCORD_WEBHOOK_URL, json=data)
+        if response.status_code != 204:
+            logging.error(f"Discord bildirim hatası: {response.status_code}")
+    except Exception as e:
+        logging.error(f"Discord bildirim gönderilemedi: {e}")
+
+def send_notifications(message, bot=None):
+    if bot:
+        try:
+            bot.send_message(chat_id=CHAT_ID, text=message)
+        except Exception as e:
+            logging.error(f"Telegram bildirimi gönderilemedi: {e}")
+    send_email("Hit Bot Bildirimi", message)
+    send_discord_notification(message)
+
+# --- ASYNC HIT FONKSİYONLARI ---
+
+async def async_hit(session, url, proxy):
+    headers = {
+        "User-Agent": random.choice(user_agents),
+        "Referer": "https://google.com"
+    }
+    proxy_url = proxy
+    try:
+        start = time.time()
+        async with session.get(url, headers=headers, proxy=proxy_url, timeout=10) as resp:
+            status = resp.status
+            elapsed = time.time() - start
+            return (True, status, elapsed, proxy, url)
+    except Exception as e:
+        return (False, str(e), 0, proxy, url)
+
+async def async_hit_batch(concurrent):
+    global proxies, urls, proxy_errors, hit_count, fail_count, total_request_time
+
+    connector = aiohttp.TCPConnector(limit_per_host=concurrent)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        tasks = []
+        for _ in range(concurrent):
+            if not proxies or not urls:
+                break
+            url = random.choice(urls)
+            proxy = random.choice(proxies)
+            tasks.append(async_hit(session, url, proxy))
+
+        results = await asyncio.gather(*tasks)
+
+        for success_flag, status_or_error, elapsed, proxy, url in results:
+            if success_flag:
+                hit_count += 1
+                total_request_time += elapsed
+                proxy_errors[proxy] = 0
+                logging.info(f"[{hit_count}] ✅ {url} | Proxy: {proxy} | Status: {status_or_error} | Süre: {elapsed:.2f}s")
+                print(f"[{hit_count}] ✅ {url} | Proxy: {proxy} | Status: {status_or_error} | Süre: {elapsed:.2f}s")
+            else:
+                fail_count += 1
+                proxy_errors[proxy] = proxy_errors.get(proxy, 0) + 1
+                logging.error(f"❌ Proxy hatası: {proxy} | Hata: {status_or_error} | Fail sayısı: {proxy_errors[proxy]}")
+                print(f"❌ Proxy hatası: {proxy} | Hata: {status_or_error} | Fail sayısı: {proxy_errors[proxy]}")
+
+                if proxy_errors[proxy] >= 5:
+                    try:
+                        proxies.remove(proxy)
+                        save_banned_proxy(proxy)
+                        ban_msg = f"⛔ Proxy banlandı ve çıkarıldı: {proxy}"
+                        logging.warning(ban_msg)
+                        print(ban_msg)
+                    except ValueError:
+                        pass
+
+# --- ASYNC LOOP ---
+
+async def async_hit_loop(bot, concurrent=50):
+    global bot_running, proxies, urls
+
+    while bot_running:
+        if not proxies:
+            msg = "Proxy listesi boş. Bot durduruluyor."
+            logging.warning(msg)
+            send_notifications(msg, bot)
+            print(msg)
+            break
+        if not urls:
+            msg = "URL listesi boş. Bot durduruluyor."
+            logging.warning(msg)
+            send_notifications(msg, bot)
+            print(msg)
+            break
+
+        await async_hit_batch(concurrent)
+        await asyncio.sleep(0.5)  # İstekler arası kısa bekleme
+
+# --- THREAD İÇİN WRAPPER ---
+
+def start_async_loop(bot):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(async_hit_loop(bot))
+
+# --- TELEGRAM KOMUTLARI ---
+
+def start_command(update: Update, context):
+    global bot_running, hit_thread, hit_count, fail_count, total_request_time, start_time
+    if update.effective_chat.id != CHAT_ID:
+        return
+    if not bot_running:
+        load_proxies()
+        load_urls()
+        bot_running = True
+        hit_count = 0
+        fail_count = 0
+        total_request_time = 0
+        start_time = time.time()
+        hit_thread = threading.Thread(target=start_async_loop, args=(context.bot,))
+        hit_thread.start()
+        update.message.reply_text("✅ Bot başlatıldı! (Hızlı Async Hit modu)")
+        logging.info("Bot başlatıldı.")
+        send_notifications("🤖 Bot başlatıldı.", context.bot)
+    else:
+        update.message.reply_text("⚠️ Bot zaten çalışıyor.")
+
+def stop_command(update: Update, context):
+    global bot_running
+    if update.effective_chat.id != CHAT_ID:
+        return
+    if bot_running:
+        bot_running = False
+        update.message.reply_text("⛔ Bot durduruldu.")
+        logging.info("Bot durduruldu.")
+        send_notifications("⛔ Bot durduruldu.", context.bot)
+    else:
+        update.message.reply_text("⚠️ Bot zaten durdurulmuş.")
+
+def status_command(update: Update, context):
+    if update.effective_chat.id != CHAT_ID:
+        return
+    text = f"🕒 Bot durumu: {'Çalışıyor' if bot_running else 'Durduruldu'}\n" \
+           f"🌐 URL sayısı: {len(urls)}\n" \
+           f"🛡️ Aktif proxy sayısı: {len(proxies)}"
+    update.message.reply_text(text)
+
+def stats_command(update: Update, context):
+    if update.effective_chat.id != CHAT_ID:
+        return
+    elapsed = int(time.time() - start_time) if start_time else 0
+    success_rate = (hit_count / (hit_count + fail_count) * 100) if (hit_count + fail_count) > 0 else 0
+    avg_request_time = (total_request_time / hit_count) if hit_count > 0 else 0
+
+    text = (
+        f"📊 Bot İstatistikleri:\n"
+        f"✔️ Başarılı hit: {hit_count}\n"
+        f"❌ Hatalı hit: {fail_count}\n"
+        f"🔢 Başarı oranı: %{success_rate:.2f}\n"
+        f"⏱️ Ortalama istek süresi: {avg_request_time:.2f} saniye\n"
+        f"🕒 Çalışma süresi: {elapsed} saniye\n"
+        f"🛡️ Aktif proxy sayısı: {len(proxies)}\n"
+        f"🌐 URL sayısı: {len(urls)}"
+    )
+    update.message.reply_text(text)
+
+def getlog_command(update: Update, context):
+    if update.effective_chat.id != CHAT_ID:
+        return
+    try:
+        with open("log.txt", "rb") as log_file:
+            update.message.reply_document(log_file)
+    except Exception:
+        update.message.reply_text("❌ Log dosyası gönderilemedi.")
+
+def urls_command(update: Update, context):
+    if update.effective_chat.id != CHAT_ID:
+        return
+    if not urls:
+        update.message.reply_text("⚠️ URL listesi boş.")
+    else:
+        mesaj = "\n".join([f"{i}. {u}" for i, u in enumerate(urls)])
+        update.message.reply_text(f"🌐 URL Listesi:\n{mesaj}")
+
+def addurl_command(update: Update, context):
+    global urls
+    if update.effective_chat.id != CHAT_ID:
+        return
+    if context.args:
+        new_url = context.args[0]
+        if new_url not in urls:
+            urls.append(new_url)
+            with open("urls.txt", "a") as f:
+                f.write(new_url + "\n")
+            update.message.reply_text(f"✅ URL eklendi: {new_url}")
+            logging.info(f"URL eklendi: {new_url}")
+        else:
+            update.message.reply_text("⚠️ Bu URL zaten mevcut.")
+    else:
+        update.message.reply_text("❌ Kullanım: /addurl https://site.com")
+
+def delurl_command(update: Update, context):
+    global urls
+    if update.effective_chat.id != CHAT_ID:
+        return
+    if context.args:
+        try:
+            idx = int(context.args[0])
+            deleted = urls.pop(idx)
+            with open("urls.txt", "w") as f:
+                f.write("\n".join(urls) + "\n")
+            update.message.reply_text(f"🗑️ URL silindi: {deleted}")
+            logging.info(f"URL silindi: {deleted}")
+        except (ValueError, IndexError):
+            update.message.reply_text("❌ Geçerli bir index girin. Örnek: /delurl 2")
+    else:
+        update.message.reply_text("❌ Kullanım: /delurl <index>")
+
+def clearurls_command(update: Update, context):
+    global urls
+    if update.effective_chat.id != CHAT_ID:
+        return
+    urls = []
+    with open("urls.txt", "w") as f:
+        f.write("")
+    update.message.reply_text("🧹 Tüm URL'ler temizlendi.")
+    logging.info("URL listesi temizlendi.")
+
+def proxies_command(update: Update, context):
+    if update.effective_chat.id != CHAT_ID:
+        return
+    if not proxies:
+        update.message.reply_text("⚠️ Proxy listesi boş.")
+    else:
+        mesaj = "\n".join([f"{i}. {p}" for i, p in enumerate(proxies)])
+        update.message.reply_text(f"🛡️ Proxy Listesi:\n{mesaj}")
+
+def addproxy_command(update: Update, context):
+    global proxies
+    if update.effective_chat.id != CHAT_ID:
+        return
+    if context.args:
+        new_proxy = context.args[0]
+        if new_proxy not in proxies:
+            proxies.append(new_proxy)
+            with open("proxy.txt", "a") as f:
+                f.write(new_proxy + "\n")
+            update.message.reply_text(f"✅ Proxy eklendi: {new_proxy}")
+            logging.info(f"Proxy eklendi: {new_proxy}")
+        else:
+            update.message.reply_text("⚠️ Bu proxy zaten mevcut.")
+    else:
+        update.message.reply_text("❌ Kullanım: /addproxy http://ip:port")
+
+def delproxy_command(update: Update, context):
+    global proxies
+    if update.effective_chat.id != CHAT_ID:
+        return
+    if context.args:
+        try:
+            idx = int(context.args[0])
+            deleted = proxies.pop(idx)
+            with open("proxy.txt", "w") as f:
+                f.write("\n".join(proxies) + "\n")
+            update.message.reply_text(f"🗑️ Proxy silindi: {deleted}")
+            logging.info(f"Proxy silindi: {deleted}")
+        except (ValueError, IndexError):
+            update.message.reply_text("❌ Geçerli bir index girin. Örnek: /delproxy 2")
+    else:
+        update.message.reply_text("❌ Kullanım: /delproxy <index>")
+
+def clearproxies_command(update: Update, context):
+    global proxies
+    if update.effective_chat.id != CHAT_ID:
+        return
+    proxies = []
+    with open("proxy.txt", "w") as f:
+        f.write("")
+    update.message.reply_text("🧹 Tüm proxyler temizlendi.")
+    logging.info("Proxy listesi temizlendi.")
+
+def main():
+    updater = Updater(TELEGRAM_TOKEN, use_context=True)
+    dp = updater.dispatcher
+
+    dp.add_handler(CommandHandler("start", start_command))
+    dp.add_handler(CommandHandler("stop", stop_command))
+    dp.add_handler(CommandHandler("status", status_command))
+    dp.add_handler(CommandHandler("stats", stats_command))
+    dp.add_handler(CommandHandler("getlog", getlog_command))
+
+    dp.add_handler(CommandHandler("urls", urls_command))
+    dp.add_handler(CommandHandler("addurl", addurl_command))
+    dp.add_handler(CommandHandler("delurl", delurl_command))
+    dp.add_handler(CommandHandler("clearurls", clearurls_command))
+
+    dp.add_handler(CommandHandler("proxies", proxies_command))
+    dp.add_handler(CommandHandler("addproxy", addproxy_command))
+    dp.add_handler(CommandHandler("delproxy", delproxy_command))
+    dp.add_handler(CommandHandler("clearproxies", clearproxies_command))
+
+    updater.start_polling()
+    updater.idle()
+
+if __name__ == "__main__":
+    main()
